@@ -9,8 +9,17 @@
 #define ENA D3
 #define ENB D4
 #define BOTOEIRA D7 // Sensor de colisão (botão)
+#define PINO_ADC A0 // Entrada para leitura da tensão
 
 ESP8266WebServer server(80);
+
+// --- VARIÁVEIS LED E MOVIMENTO ---
+bool emMovimento = false;
+bool colidido = false;
+
+unsigned long ultimoBlink = 0;
+bool estadoLED = false;
+const unsigned long intervaloBlink = 500; // pisca a cada 500ms
 
 // --- VARIÁVEIS DE ESTADO ---
 bool modoManual = false;
@@ -26,34 +35,48 @@ unsigned long tempoUltimaMudanca = 0;
 const unsigned long tempoBaterVirar = 30000; // 30s
 const unsigned long tempoEspiral = 20000;    // 20s
 
+// --- CONSTANTES PARA LEITURA DA TENSÃO ---
+const float ADC_MAX = 1023.0;
+const float TENS_MAX_SENSOR = 16.0;   // sensor mede até 25V
+const float TENS_MAX_ADC = 1.0;        // tensão máxima no ADC (após divisor)
+const float TENS_LIMIAR = 5.0;        // limite de corte da bateria (em volts)
+
+// --- VARIÁVEL PARA TENSÃO ATUAL ---
+float tensaoBateriaAtual = 0.0;
+
 // --- FUNÇÕES DE CONTROLE DE MOVIMENTO ---
 void parar() {
   digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  emMovimento = false;
   Serial.println("Parando...");
 }
 
 void frente() {
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  emMovimento = true;
   Serial.println("Indo pra frente...");
 }
 
 void re() {
   digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
   digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  emMovimento = true;
   Serial.println("Recuando...");
 }
 
 void virarDireita() {
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  emMovimento = true;
   Serial.println("Virando à direita...");
 }
 
 void virarEsquerda() {
   digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  emMovimento = true;
   Serial.println("Virando à esquerda...");
 }
 
@@ -61,11 +84,13 @@ void virarEsquerda() {
 void logicaBaterEVirar() {
   if (digitalRead(BOTOEIRA) == LOW) {
     Serial.println(">> Colisão detectada (modo bater e virar)");
+    colidido = true;
     parar();
     delay(300);
     re(); delay(800);
     virarDireita(); delay(700);
     frente();
+    colidido = false;
   } else {
     frente();
   }
@@ -74,9 +99,11 @@ void logicaBaterEVirar() {
 void logicaEspiral() {
   if (digitalRead(BOTOEIRA) == LOW) {
     Serial.println(">> Colisão detectada no modo espiral! Executando evasão...");
+    colidido = true;
     parar(); delay(300);
     re(); delay(800);
     virarEsquerda(); delay(700);
+    colidido = false;
   }
 
   Serial.println(">> Executando movimento em espiral...");
@@ -84,6 +111,15 @@ void logicaEspiral() {
   analogWrite(ENB, 700);   // Motor B mais lento = curva
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  emMovimento = true;
+}
+
+// --- LEITURA DA TENSÃO DA BATERIA ---
+float lerTensaoBateria() {
+  int valorADC = analogRead(PINO_ADC);
+  float tensaoADC = (valorADC / ADC_MAX) * TENS_MAX_ADC; // tensão no ADC (0-1V)
+  float tensaoBateria = tensaoADC * (TENS_MAX_SENSOR / TENS_MAX_ADC);
+  return tensaoBateria;
 }
 
 // --- INTERFACE WEB ---
@@ -111,6 +147,8 @@ const char pagina[] PROGMEM = R"rawliteral(
     <button onclick="enviar('direita')">Direita</button><br>
     <button onclick="enviar('re')">Ré</button>
   </div>
+  <br>
+  <div><strong>Tensão da bateria: </strong><span id="tensao">Carregando...</span> V</div>
 <script>
 function enviar(cmd) {
   fetch('/cmd?acao=' + cmd);
@@ -120,6 +158,20 @@ function enviar(cmd) {
     document.getElementById('controlesManual').style.display = 'none';
   }
 }
+
+function atualizarTensao() {
+  fetch('/tensao')
+    .then(response => response.text())
+    .then(data => {
+      document.getElementById('tensao').innerText = data;
+    })
+    .catch(() => {
+      document.getElementById('tensao').innerText = 'Erro';
+    });
+}
+
+setInterval(atualizarTensao, 2000); // atualiza a cada 2s
+atualizarTensao();
 </script>
 </body>
 </html>
@@ -158,11 +210,36 @@ void handleCmd() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleTensao() {
+  server.send(200, "text/plain", String(tensaoBateriaAtual, 2));
+}
+
+void atualizarLED() {
+  if (colidido) {
+    digitalWrite(LED_BUILTIN, LOW); // aceso fixo (LED é ativo LOW no ESP8266)
+    return;
+  }
+
+  if (emMovimento) {
+    unsigned long agora = millis();
+    if (agora - ultimoBlink >= intervaloBlink) {
+      ultimoBlink = agora;
+      estadoLED = !estadoLED;
+      digitalWrite(LED_BUILTIN, estadoLED ? LOW : HIGH); // pisca
+    }
+  } else {
+    digitalWrite(LED_BUILTIN, HIGH); // apagado
+  }
+}
+
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("Iniciando robô...");
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // apagado inicialmente
 
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
@@ -182,6 +259,7 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/cmd", handleCmd);
+  server.on("/tensao", handleTensao);
   server.begin();
   Serial.println("Servidor web iniciado!");
 }
@@ -190,27 +268,38 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  if (!modoManual) {
-    unsigned long agora = millis();
+  tensaoBateriaAtual = lerTensaoBateria();
+  Serial.print("Tensão da bateria: ");
+  Serial.print(tensaoBateriaAtual);
+  Serial.println(" V");
 
-    switch (estadoAuto) {
-      case MODO_BATER_VIRAR:
-        logicaBaterEVirar();
-        if (agora - tempoUltimaMudanca > tempoBaterVirar) {
-          estadoAuto = MODO_ESPIRAL;
-          tempoUltimaMudanca = agora;
-          Serial.println(">> Mudando para modo espiral...");
-        }
-        break;
+  if (tensaoBateriaAtual < TENS_LIMIAR) {
+    Serial.println("!! Tensão abaixo de 11V! Desligando motores para proteger bateria.");
+    parar();  // para os motores
+  } else {
+    if (!modoManual) {
+      unsigned long agora = millis();
 
-      case MODO_ESPIRAL:
-        logicaEspiral();
-        if (agora - tempoUltimaMudanca > tempoEspiral) {
-          estadoAuto = MODO_BATER_VIRAR;
-          tempoUltimaMudanca = agora;
-          Serial.println(">> Voltando para modo bater e virar...");
-        }
-        break;
+      switch (estadoAuto) {
+        case MODO_BATER_VIRAR:
+          logicaBaterEVirar();
+          if (agora - tempoUltimaMudanca > tempoBaterVirar) {
+            estadoAuto = MODO_ESPIRAL;
+            tempoUltimaMudanca = agora;
+            Serial.println(">> Mudando para modo espiral...");
+          }
+          break;
+
+        case MODO_ESPIRAL:
+          logicaEspiral();
+          if (agora - tempoUltimaMudanca > tempoEspiral) {
+            estadoAuto = MODO_BATER_VIRAR;
+            tempoUltimaMudanca = agora;
+            Serial.println(">> Voltando para modo bater e virar...");
+          }
+          break;
+      }
     }
   }
+  atualizarLED();
 }
